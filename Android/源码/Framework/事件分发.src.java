@@ -1,3 +1,5 @@
+/**************SDK 层**************/
+
 //--注册InputEventReceiver
 ViewRootImpl.setView{
     inputChannel = new InputChannel();
