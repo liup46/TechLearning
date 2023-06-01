@@ -1,0 +1,450 @@
+## 1.1Activity启动前半部分（截止到ActivityThread）
+```groovy
+Activity.startActivity(Intent intent, @Nullable Bundle options)->startActivityForResult{
+    Instrumentation.execStartActivity{
+        /***Binder跨进程，切换到ATMS 进程***/
+        ActivityTaskManager.getService()@ATMS.startActivity->startActivityAsUser{ 
+            getActivityStartController().obtainStarter@ActivityStarter.execute -> executeRequest{
+                ActivityRecord r = new ActivityRecord:WindowToken{
+                    token = new Token(_intent).asBinder()
+                    appToken = token
+                    appToken.attach(this);
+                }
+                startActivityUnchecked->startActivityInner{
+                    .setInitialState
+                    .computeLaunchingTaskFlags
+                    .mTargetRootTask@Task = getLaunchRootTask(mStartActivity, mLaunchFlags, targetTask, mOptions);//获取或者创建一个新的task
+                    .mTargetRootTask@Task.startActivityLocked()
+                    if (mDoResume) {
+                        // If the activity is not focusable,
+                        if (!mTargetRootTask.isTopActivityFocusable()|| (topTaskActivity != null && topTaskActivity.isTaskOverlay() && mStartActivity != topTaskActivity)) {
+                            .Task.ensureActivitiesVisible->..updateActivityVisibilities->.EnsureActivitiesVisibleHelper.process->.setActivityVisibilityState->.makeVisibleAndRestartIfNeeded->
+                            .ActivityTaskSupervisor.startSpecificActivity(r@ActivityRecord){
+                                final WindowProcessController wpc = .ActivityTaskManagerService.getProcessController(r.processName, r.info.applicationInfo.uid);
+                                //有进程scheduleTransaction直接启动activity
+                                if (wpc != null && wpc.hasThread()) { 
+                                    realStartActivityLocked{
+                                        clientTransaction = ClientTransaction.obtain(mClient@IApplicationThread=wpc.getThread(), mActivityToken = r.appToken).addCallback(LaunchActivityItem.obtain(new Intent(r.intent))
+                                            .setLifecycleStateRequest(ResumeActivityItem.obtain)
+                                        .ActivityTaskManagerService.getLifecycleManager()@ClientLifecycleManager.scheduleTransaction(clientTransaction){
+                                            clientTransaction.schedule{
+                                                /***Binder跨进程，通过 IApplicationThread 切换到应用的ActivityThread进程 ***/
+                                                mClient@IApplicationThread.scheduleTransaction(clientTransaction){
+                                                    //see  1.2Activity启动后半部分
+                                                }
+                                            }
+                                        }
+                                    } 
+                                    return;
+                                }
+                                //无进程启动进程
+                                .ActivityTaskManagerService.startProcessAsync(r, knownToBeDead, isTop, isTop ? "top-activity" : "activity"){
+                                    .initialize{
+                                        .mH = Handler(DisplayThread.get().getLooper)
+                                    }
+                                    mH.sendMessage(PooledLambda.obtainMessage(ActivityManagerInternal::startProcess(..activity.processName..){ 
+                                        //activity.processName or ApplicationInfo.processName  作为process name
+                                        //run on DisplayThread
+                                        AMS.startProcessLocked(new HostingRecord(hostingType, hostingName, isTop)){ //HostingRecord 持有activity 信息
+                                            .mProcessList.startProcessLocked // see ProcessList startProcessLocked
+                                        }
+                                    }))
+                                }
+                            }
+                        }else{
+                            mTargetRootTask.moveToFront("startActivityInner");
+                            mRootWindowContainer.resumeFocusedTasksTopActivities(mTargetRootTask, mStartActivity, mOptions, mTransientLaunch){
+                                Task.resumeTopActivityUncheckedLocked->resumeTopActivityInnerLocked{
+                                    topRunningActivity(true /* focusableOnly */).getTaskFragment@TaskFragment.resumeTopActivity{
+                                        .ActivityTaskSupervisor.startSpecificActivity //see top
+                                    }
+                                }
+                            }
+                        }
+                        
+                    }
+                }
+            }
+        }
+    }
+}
+```
+## 1.2Activity启动后半部分
+```java
+//应用进程
+ApplicationThread.scheduleTransaction(clientTransaction){
+    ^ActivityThread:ClientTransactionHandler.scheduleTransaction(clientTransaction){
+        clientTransaction.preExecute{
+            ActivityClientRecord r = new ActivityClientRecord(token =.mActivityToken);
+            ^ActivityThread.addLaunchingActivity(r)
+        }
+        sendMessage(ActivityThread.H.EXECUTE_TRANSACTION, transaction)->ActivityThread.H.handleMessage(msg.what = EXECUTE_TRANSACTION){
+            final ClientTransaction transaction = (ClientTransaction) msg.obj;
+            &TransactionExecutor(.ActivityThread).execute(transaction){
+                .executeCallbacks{
+                    transaction.callback@LaunchActivityItem.execute(activityThread@ActivityThread:ClientTransactionHandler){
+                        activityThread.handleLaunchActivity(r:ActivityClientRecord, pendingActions, null /* customIntent */){
+                            unscheduleGcIdler()
+                            if (r.profilerInfo != null) {
+                                mProfiler.setProfiler(r.profilerInfo);
+                                mProfiler.startProfiling();
+                            }
+                            // Make sure we are running with the most recent config.
+                            mConfigurationController.handleConfigurationChanged(null, null);
+                            // Initialize before creating the activity
+                            HardwareRenderer.preload(); 
+                            WindowManagerGlobal.initialize();
+                            Activity a = performLaunchActivity{
+                                ContextImpl appContext = createBaseContextForActivity(r);
+                                activity = mInstrumentation.newActivity(appContext.getClassLoader(), component.getClassName(), r.intent);
+                                mActivities.put(r.token, r);
+                                activity.attach(appContext, ., , .Instrumentation){
+                                    mFragments@FragmentController.attachHost(null)
+                                    mWindow = new PhoneWindow(this, window, activityConfigCallback);
+                                    mWindow.setWindowControllerCallback(mWindowControllerCallback);
+                                    mWindow.setCallback(this);
+                                    mWindow.setOnWindowDismissedCallback(this);
+                                    mWindow.getLayoutInflater().setPrivateFactory(this);
+                                    mUiThread = Thread.currentThread();
+                                    mMainThread@ActivityThread = aThread;
+                                    mInstrumentation = instr;
+                                    mToken = token;
+                                    mApplication = application;
+                                    mIntent = intent;
+                                    mWindow.setWindowManager((WindowManager)context.getSystemService(Context.WINDOW_SERVICE),mToken);
+                                }
+                                mInstrumentation.callActivityOnCreate(activity, r.state){
+                                    activity.performCreate(icicle){
+                                        .onCreate{
+                                            setContentView{
+                                                PhoneWindow.installDecor{
+                                                    mDecor = generateDecor(featureId=-1);
+                                                }
+                                            }
+                                        }
+                                        mFragments.dispatchActivityCreated()
+                                    }
+                                }
+                                r.setState(ON_CREATE);
+                            }
+                            if (a != null) {
+                                r.createdConfig = new Configuration(mConfigurationController.getConfiguration());
+                                reportSizeConfigurations(r);
+                                if (!r.activity.mFinished && pendingActions != null) {
+                                    pendingActions.setOldState(r.state);
+                                    pendingActions.setRestoreInstanceState(true); //see ActivityThread.handleStartActivity->activity.performRestoreInstanceState
+                                    pendingActions.setCallOnPostCreate(true); //see ActivityThread.handleStartActivity->activity.onPostCreate
+                                }
+                            }
+                        }
+                    }
+                }
+                .executeLifecycleState{
+                    // Cycle to the state right before the final requested state.
+                    cycleToPath(r@ActivityClientRecord, lifecycleItem.getTargetState(), true /* excludeLastState */, transaction){
+                        final int start = r.getLifecycleState(); //start:ON_CREATE
+                        final IntArray path = mHelper.getLifecyclePath(start, finish, excludeLastState); 
+                        performLifecycleSequence(r, path, transaction){
+                            //start activity
+                            .ActivityThread.handleStartActivity(r@ActivityClientRecord, mPendingActions,null /* activityOptions */){
+                                unscheduleGcIdler();
+                                r.setState(ON_START);
+                                activity.performStart("handleStartActivity"){
+                                    mFragments@FragmentController.execPendingActions();
+                                    mInstrumentation.callActivityOnStart(activity){
+                                         activity.onStart();
+                                    }
+                                    mFragments.dispatchStart();
+                                }
+                                // Restore instance state
+                                if (pendingActions!= null && pendingActions.shouldRestoreInstanceState()) {
+                                    if (r.state != null) {
+                                        mInstrumentation.callActivityOnRestoreInstanceState(activity, r.state){
+                                            activity.performRestoreInstanceState(savedInstanceState)
+                                        }
+                                    }
+                                }
+                                 // Call postOnCreate()
+                                if (pendingActions.shouldCallOnPostCreate()) {
+                                    activity.mCalled = false;
+                                    mInstrumentation.callActivityOnPostCreate(activity, r.state){
+                                        activity.onPostCreate(savedInstanceState);
+                                    }
+                                }
+                            }
+                            //resume activity
+                            .ActivityThread.handleResumeActivity(r, finalStateRequest= false,r.isForward, "LIFECYCLER_RESUME_ACTIVITY"){
+                                bool performResult = performResumeActivity(r, finalStateRequest, reason){
+                                    if (finalStateRequest) {
+                                        r.hideForNow = false;
+                                        r.activity.mStartedActivity = false;
+                                    }
+                                    if (r.pendingIntents != null) {
+                                        deliverNewIntents(r, r.pendingIntents)->mInstrumentation.callActivityOnNewIntent(r.activity, intent){
+                                            activity.performNewIntent(intent)->activity.onNewIntent(intent);
+                                        }
+                                        r.pendingIntents = null;
+                                    }
+                                    if (r.pendingResults != null) {
+                                        deliverResults(r, r.pendingResults, reason){
+                                            r.activity.dispatchActivityResult(who= ri.mResultWho,ri.mRequestCode, ri.mResultCode, ri.mData, reason){
+                                                if (who == null) {
+                                                    onActivityResult(requestCode, resultCode, data);
+                                                } else if (who.startsWith(REQUEST_PERMISSIONS_WHO_PREFIX){
+                                                    who = who.substring(REQUEST_PERMISSIONS_WHO_PREFIX.length());
+                                                    if (TextUtils.isEmpty(who)) dispatchRequestPermissionsResult(requestCode, data) else {
+                                                        mFragments.findFragmentByWho(who)?.dispatchRequestPermissionsResultToFragment(requestCode, data, frag);
+                                                    }
+                                                }else if (who.startsWith("@android:view:")) {
+                                                    ArrayList<ViewRootImpl> views = WindowManagerGlobal.getInstance().getRootViews(getActivityToken());
+                                                    views.findNotNull{viewRoot.getView()?.dispatchActivityResult(who, requestCode, resultCode, data)}
+                                                }else {
+                                                    mFragments.findFragmentByWho(who)?.onActivityResult(requestCode, resultCode, data);
+                                                }
+                                            }
+                                        }
+                                        r.pendingResults = null;
+                                    }
+                                    r.activity.performResume(r.startsNotResumed, reason){
+                                        performRestart(true /* start */, reason); // if activity is stoped , then restart 
+                                        mInstrumentation.callActivityOnResume(this){
+                                            activity.mResumed = true;
+                                            activity.onResume();
+                                        }
+                                        mFragments.dispatchResume();
+                                        onPostResume(){
+                                            final Window win = getWindow();
+                                            if (win != null) win.makeActive();
+                                        }
+                                    }
+                                    r.setState(ON_RESUME);
+                                    return true
+                                }
+                                if (!performResult) {
+                                    return;
+                                }
+                                if (r.window == null && !a.mFinished && willBeVisible) {
+                                    r.window = r.activity.getWindow();
+                                    View decor = r.window.getDecorView();
+                                    decor.setVisibility(View.INVISIBLE);
+                                    ViewManager wm = a.getWindowManager();
+                                    WindowManager.LayoutParams l = r.window.getAttributes();
+                                    a.mDecor = decor;
+                                    l.type = WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
+                                    if (r.mPreserveWindow) {
+                                        a.mWindowAdded = true;
+                                        r.mPreserveWindow = false;
+                                        ViewRootImpl impl = decor.getViewRootImpl()?.notifyChildRebuilt();//see window 
+                                    }
+                                    if (a.mVisibleFromClient) {
+                                        if (!a.mWindowAdded) {
+                                            a.mWindowAdded = true;
+                                            wm.addView(decor, l); //see WindowManger文档 
+                                        } else {
+                                            a.onWindowAttributesChanged(l);
+                                        }
+                                    }
+                                }
+                                if (!r.activity.mFinished && willBeVisible && r.activity.mDecor != null && !r.hideForNow) {
+                                    r.activity.mVisibleFromServer = true;
+                                    mNumVisibleActivities++;
+                                    if (r.activity.mVisibleFromClient) {
+                                        r.activity.makeVisible(){
+                                            if (!mWindowAdded) {
+                                                ViewManager wm = getWindowManager();
+                                                wm.addView(mDecor, getWindow().getAttributes());
+                                                mWindowAdded = true;
+                                            }
+                                            mDecor.setVisibility(View.VISIBLE);//显示decor
+                                        }
+                                    }
+                                }
+                                r.nextIdle = mNewActivities;
+                                mNewActivities = r;
+                                Looper.myQueue().addIdleHandler(new Idler());
+                            }
+                        }
+                    }
+                    ResumeActivityItem lifecycleItem = transaction.getLifecycleStateRequest()
+                    lifecycleItem.execute(ActivityThread@ClientTransactionHandler){
+                        //fast resume again
+                        .ActivityThread.handleResumeActivity(r, finalStateRequest=true, mIsForward,"RESUME_ACTIVITY");
+                    }
+                    lifecycleItem.postExecute(mTransactionHandler@ActivityThread, token, mPendingActions){
+                        ActivityClient.getInstance().activityResumed(token, client.isHandleSplashScreenExit(token));
+                    }
+                }
+            }
+        }
+    }
+}
+```
+   
+
+## 2.1应用进程启动 AMS 通过ProcessList fork进程
+```java
+ProcessList{
+    mProcessNames(ProcessMap())
+    .ProcessStateRecord()
+    .ProcessErrorStateRecord()
+    .mService@ActivityManagerService
+
+    .startProcessLocked(){
+        if (app == null) {
+            checkSlow(startTime, "startProcess: creating new process record");
+            app = newProcessRecordLocked(info, processName, isolated, isolatedUid, hostingRecord){
+                r = ProcessRecord(mService, info, proc, uid);
+                mProcessNames.put(r.processName,r.uid. r){
+                    mService.mAtmInternal:ActivityTaskManagerInternal.onProcessAdded(r.getWindowProcessController()){
+                        ActivityTaskManagerService.mProcessNames.put(proc.mName, proc.mUid, proc);//往ActivityTaskManagerService中加入 add WindowProcessController
+                    }
+                }
+            }
+        }
+        app.setStartParams(uid, hostingRecord, seInfo, startTime); //设置启动activity hostingRecord
+        .startProcess(){
+            Process.start{
+                ZygoteProcess().start(){
+                    startViaZygote{ //processClass : "android.app.ActivityThread"
+                        zygoteSendArgsAndGetResult->{
+                            //往socket写数据
+                            final BufferedWriter zygoteWriter = zygoteState.mZygoteOutputWriter;
+                            final DataInputStream zygoteInputStream = zygoteState.mZygoteInputStream;
+
+                            zygoteWriter.write(msgStr);
+                            zygoteWriter.flush();
+
+                            //读socket 返回的pid
+                            Process.ProcessStartResult result = new Process.ProcessStartResult();
+                            result.pid = zygoteInputStream.readInt();
+                            result.usingWrapper = zygoteInputStream.readBoolean();
+
+                            return result;
+                        }
+                    }
+                    
+                }
+            }
+        }
+    }
+}
+```
+
+## 2.2 进程fork后执行流程AcitivityThread
+```java
+AcitivityThread.main{
+    Looper.prepareMainLooper(); 
+    ActivityThread(){
+        mAppThread = ApplicationThread();
+        final ArrayList<Application> mAllApplications = new ArrayList<>();
+        _mResourcesManager = ResourcesManager.getInstance()
+    }.attach(false){
+        _sCurrentActivityThread = .
+        .ConfigurationController(.);
+        //Binder 跨进程通信
+        AMS.attachApplication(.mAppThread@IApplicationThread, startSeq){
+            attachApplicationLocked(mAppThread){
+                ProcessRecord app = mPidsSelfLocked.get(pid);
+                 //获取所有contentProvide
+                List<ProviderInfo> providers = .ContentProviderHelper.generateApplicationProvidersLocked(app)
+                mAppThread@IApplicationThread.bindApplication(services@Map=getCommonServicesLocked(app.isolated)){
+                     if (services != null) {
+                         // Setup the service cache in the ServiceManager
+                        ServiceManager.initServiceCache(services);
+                     }
+                    data = AppBindData();
+                    &ActivityThread.sendMessage(H.BIND_APPLICATION, data) -> &ActivityThread.mh@H.handleMessage{
+                        ActivityThread.handleBindApplication(data){
+                            if (.mProfiler@Profiler.profileFd != null) {
+                                mProfiler.startProfiling();
+                            }
+                            data.info@LoadedApk = getPackageInfoNoCheck(data.appInfo, data.compatInfo);
+
+                            if (agent != null) {
+                                handleAttachAgent(agent, data.info);
+                            }
+                            mInstrumentation = Instrumentation();
+                            Application app = data.info@LoadedApk.makeApplication{
+                                ContextImpl appContext = ContextImpl.createAppContext(.mActivityThread, .)
+
+                                Application app = .mActivityThread.mInstrumentation.newApplication(cl, appClass, appContext){
+                                    Application app = getFactory(context.getPackageName()).instantiateApplication(cl, className); //反射
+                                    app.attach(context);
+                                }
+                                appContext.setOuterContext(app);
+                                .mActivityThread.mAllApplications.add(app);
+                                .mApplication = app;
+                            }
+                            if (!ArrayUtils.isEmpty(data.providers)) {
+                                installContentProviders(app, data.providers){
+                                    installProvider{
+                                        ContentProvider localProvider = packageInfo.getAppFactory().instantiateProvider(cl, info.name);//反射
+                                        localProvider.attachInfo(c, info){
+                                            onCreate();
+                                        }
+                                    }
+                                }
+                            }
+                            mInstrumentation.onCreate(data.instrumentationArgs);
+                            mInstrumentation.callApplicationOnCreate(app){
+                                //Application oncreate
+                                app@Application.onCreate();
+                            }
+                        }
+                    }
+                }
+                app@ProcessRecord.makeActive(mAppThread, mProcessStats){
+                    .IApplicationThread = mAppThread;
+                    .WindowProcessController.setThread(mAppThread@IApplicationThread); 
+                }
+                .ActivityTaskManagerInternal.attachApplication(wpc= app.getWindowProcessController()){
+                    &ATMS.RootWindowContainer.attachApplication(wpc){
+                        ->RootWindowContainer::startActivityForAttachedApplicationIfNeeded(ActivityRecord r,WindowProcessController app, ActivityRecord top){
+                            //启动RootTask 的Top activity
+                            mTaskSupervisor.realStartActivityLocked
+                        }
+                    }
+                }
+                .ActiveServices.attachApplicationLocked(app, processName){
+                    // Collect any services that are waiting for this process to come up.
+                    if (mPendingServices.size() > 0) {
+                        realStartServiceLocked
+                    }
+                }
+                if (isPendingBroadcastProcessLocked(pid)) {
+                    //// The app just attached; send any pending broadcasts that it should receive
+                    sendPendingBroadcastsLocked(app){
+                        for (BroadcastQueue queue : mBroadcastQueues) {
+                            didSomething |= queue.sendPendingBroadcastsLocked(app);
+                        }
+                    }
+                }
+            }
+        }
+        BinderInternal.addGcWatcher({
+            if (Runtime.getRuntime.totalMemory-freeMemory > ((3*Runtime.getRuntime().maxMemory)/4)) { 
+                //内存大于 3/4 释放activity
+                ActivityTaskManager.getService().releaseSomeActivities(mAppThread);
+            }
+        })
+    }
+    _sMainThreadHandler = thread.getHandler();
+    Looper.loop();
+}
+
+
+ProcessRecord implements WindowProcessListener{
+    .WindowProcessController()
+    .ProcessProfileRecord
+    .ProcessErrorStateRecord
+    .IApplicationThread 
+
+}
+```
+//Todo
+VMRuntime
+VMDebug{
+    startMethodTracing
+    stopMethodTracing
+}
+Debug
