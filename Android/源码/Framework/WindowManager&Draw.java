@@ -1,4 +1,5 @@
 /****这里主要是讲java层****/
+// 入口 WindowManagerImpl.addView => ViewRootImpl().setView-> requestLayout->scheduleTraversals  => Choreographer.postCallback
 
 WindowManagerImpl{
     public final Surface mSurface = new Surface();
@@ -66,8 +67,6 @@ public ViewRootImpl(@UiContext Context context, Display display, IWindowSession 
     private final SurfaceSession mSurfaceSession = new SurfaceSession();
     private final SurfaceSyncer mSurfaceSyncer = new SurfaceSyncer();
 
-
-
     mWindowSession = session
     //创建AttachInfo
     mAttachInfo = new View.AttachInfo(mWindowSession, mWindow, display, this, mHandler, this, context);
@@ -99,7 +98,7 @@ public ViewRootImpl(@UiContext Context context, Display display, IWindowSession 
             // the acceleration too.
             //开启硬件加速
             enableHardwareAcceleration(attrs){
-                //see WindowManagerGlobal.addView的时候根据App manifest配置
+                //see WindowManagerGlobal.addView的时候默认根据App manifest配置
                 final boolean hardwareAccelerated =(attrs.flags & WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED) != 0;
                 if (hardwareAccelerated) {
                     //创建ThreadedRenderer
@@ -108,8 +107,6 @@ public ViewRootImpl(@UiContext Context context, Display display, IWindowSession 
                         if (mHardwareRendererObserver != null) {
                             mAttachInfo.mThreadedRenderer.addObserver(mHardwareRendererObserver);
                         }
-                        mAttachInfo.mThreadedRenderer.setSurfaceControl(mSurfaceControl);
-                        mAttachInfo.mThreadedRenderer.setBlastBufferQueue(mBlastBufferQueue);
                     }
                 }
             }
@@ -164,26 +161,41 @@ public ViewRootImpl(@UiContext Context context, Display display, IWindowSession 
                         boolean hadSurface = mSurface.isValid();//刚开始Surface 不valid
                         relayoutResult = relayoutWindow(params, viewVisibility, insetsPending){
                             //1.创建WindowSurfaceControl,并把它的SurfaceControl copy 给mSurfaceControl
-                            relayoutResult = mWindowSession.relayout(mSurfaceControl)->mService@WindowManagerService.relayoutWindow()
+                            relayoutResult = mWindowSession.relayout(mSurfaceControl)->mService@WindowManagerService.relayoutWindow(){
+                                 //1.1.先找到windowstate,这个windowstate就是setView->mWindowSession.addToDisplayAsUser-> WindowManagerService.addWindow调用后创建保存的
+                                final WindowState win = windowForClientLocked(session, client, false);
+                                //1.2. 创建 WindowSurfaceController  ,并copy 给ViewRootImp中的outSurfaceControl
+                                result = createSurfaceControl(outSurfaceControl, result, win, winAnimator){
+                                    surfaceController = winAnimator.createSurfaceLocked(){
+                                        mSurfaceController = new WindowSurfaceController(attrs.getTitle().toString(), format,flags, this, attrs.type);
+                                    }
+                                    
+                                    if (surfaceController != null) {
+                                        //Native COPY
+                                        surfaceController.getSurfaceControl(outSurfaceControl);
+                                    }
+                                }
+                            }
                             //2. 创建 surfcae并 copy 给ViewRootImpl mSurface
                             if (mSurfaceControl.isValid()) {
-                                if (!useBLAST()) {
-                                    //把mSurfaceControl的surface copy 给ViewRootImpl mSurface
-                                    mSurface.copyFrom(mSurfaceControl);
-                                } else { //useBLAST() == true, 由WMS在addWindow的时候设置的
-                                    updateBlastSurfaceIfNeeded(){
-                                        //1.创建BLASTBufferQueue 2.createSurface。3 transferFrom to ViewRootImpl mSurface
-                                        mBlastBufferQueue = new BLASTBufferQueue(mTag, mSurfaceControl,mSurfaceSize.x, mSurfaceSize.y, mWindowAttributes.format);
-                                        Surface blastSurface = mBlastBufferQueue.createSurface();
-                                        // Only call transferFrom if the surface has changed to prevent inc the generation ID and
-                                        // causing EGL resources to be recreated.
-                                        mSurface.transferFrom(blastSurface);
-                                    }                            
+                                 //useBLAST() == true, 由WMS在addWindow的时候设置的
+                                updateBlastSurfaceIfNeeded(){
+                                    //1.创建BLASTBufferQueue 2.createSurface。3 transferFrom to ViewRootImpl mSurface
+                                    mBlastBufferQueue = new BLASTBufferQueue(mTag, mSurfaceControl,mSurfaceSize.x, mSurfaceSize.y, mWindowAttributes.format);
+                                    Surface blastSurface = mBlastBufferQueue.createSurface();
+                                    // Only call transferFrom if the surface has changed to prevent inc the generation ID and
+                                    // causing EGL resources to be recreated.
+                                    mSurface.transferFrom(blastSurface);
+                                }                            
+                                
+                                if (mAttachInfo.mThreadedRenderer != null) {
+                                    mAttachInfo.mThreadedRenderer.setSurfaceControl(mSurfaceControl);
+                                    mAttachInfo.mThreadedRenderer.setBlastBufferQueue(mBlastBufferQueue);
                                 }
                             }
                         }
                         if (surfaceCreated) {
-                            if (mAttachInfo.mThreadedRenderer != null) {
+                            if (mAttachInfo.mThreadedRenderer != null) { //硬件加速
                                 hwInitialized = mAttachInfo.mThreadedRenderer.initialize(mSurface);
                                 if (hwInitialized && (host.mPrivateFlags & View.PFLAG_REQUEST_TRANSPARENT_REGIONS) == 0) {
                                     mAttachInfo.mThreadedRenderer.allocateBuffers();
@@ -291,7 +303,6 @@ public ViewRootImpl(@UiContext Context context, Display display, IWindowSession 
             }
         }
     }
-
 }
 
 Choreographer{
@@ -348,7 +359,7 @@ Choreographer{
                     if (!mFrameScheduled) {
                         mFrameScheduled = true;
                         if (USE_VSYNC) {
-                            if (isRunningOnLooperThreadLocked()) {
+                            if (isRunningOnLooperThreadLocked()){
                                 //发起一次Vsync信号监听
                                 scheduleVsyncLocked(){
                                     mDisplayEventReceiver@FrameDisplayEventReceiver.scheduleVsync()->.nativeScheduleVsync =>
@@ -427,7 +438,7 @@ Choreographer{
 
         doCallbacks(Choreographer.CALLBACK_INSETS_ANIMATION, frameData,frameIntervalNanos);
 
-        //处理layout和draw
+        //3.处理layout和draw
         mFrameInfo.markPerformTraversalsStart();
         doCallbacks(Choreographer.CALLBACK_TRAVERSAL, frameData, frameIntervalNanos);
         //处理post-draw operations
@@ -519,23 +530,4 @@ WindowManagerService{
             }
 
     }
-
-    relayoutWindow{
-        //1.先找到windowstate,这个windowstate就是setView->mWindowSession.addToDisplayAsUser-> WindowManagerService.addWindow调用后创建保存的
-        final WindowState win = windowForClientLocked(session, client, false);
-        //2. 创建 WindowSurfaceController  ,并copy 给ViewRootImp中的outSurfaceControl
-         result = createSurfaceControl(outSurfaceControl, result, win, winAnimator){
-            surfaceController = winAnimator.createSurfaceLocked(){
-                mSurfaceController = new WindowSurfaceController(attrs.getTitle().toString(), format,flags, this, attrs.type);
-            }
-            
-            if (surfaceController != null) {
-                //Native COPY
-                surfaceController.getSurfaceControl(outSurfaceControl);
-            }
-        }
-    }
-
-
-
 }
