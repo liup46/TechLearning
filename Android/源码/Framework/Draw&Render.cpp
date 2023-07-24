@@ -38,12 +38,12 @@ ViewRootImp.performTraversals->updateBlastSurfaceIfNeeded-> new BLASTBufferQueue
  * 接着 drawSoftware*****
     * drawSoftware(surface, mAttachInfo, xOffset, yOffset,scalingRequired, dirty, surfaceInsets){
     *   //draw3步，
+    *   //Step 1.
     *   canvas = mSurface.lockCanvas(dirty);
-    * 
-    *   //这里是调一系列的canvas的draw 方法 如： drawRect, drawBitmap =》JNI nDrawRect=》 android_graphics_Canvas.cpp 对应的drawRect 等方法=》SkiaCanvas.cpp的drawRect=》SkCanvas.cpp的onDrawRect
+    *   //Step 2.
+    *   //这里是调一系列的canvas的draw 方法 如： drawRect, drawBitmap =>JNI nDrawRect=> android_graphics_Canvas.cpp 对应的drawRect 等方法=>SkiaCanvas.cpp的drawRect=>SkCanvas.cpp的onDrawRect
     *   mView.draw(canvas); 
-    * 
-    * 
+    *  // Step 3.
     *   surface.unlockCanvasAndPost(canvas);
     *}
  *****/
@@ -227,7 +227,6 @@ Surface{
 }
 
 /****3. 硬件绘制，
-
 
 
 /****4. SurfaceFlinger，

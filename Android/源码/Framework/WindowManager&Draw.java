@@ -1,5 +1,7 @@
 /****这里主要是讲java层****/
-// 入口 WindowManagerImpl.addView => ViewRootImpl().setView-> requestLayout->scheduleTraversals  => Choreographer.postCallback
+// 入口 WindowManagerImpl.addView =>mGlobal.addView=> ViewRootImpl().setView-> requestLayout->scheduleTraversals  => Choreographer.postCallback(Choreographer.CALLBACK_TRAVERSAL, TraversalRunnable)
+//      =>Choreographer.scheduleFrameLocked=>Choreographer.scheduleVsyncLocked=>DisplayEventReceive.onVsync=>Choreographer.doFrame,doCallbacks(CALLBACK_TRAVERSAL)=>TraversalRunnable.run
+//      =>ViewRootImpl.performTraversals
 
 WindowManagerImpl{
     public final Surface mSurface = new Surface();
@@ -396,7 +398,7 @@ Choreographer{
                     }
                 }
             } else {
-                Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_CALLBACK, action);
+                Message msg = mHandler.obtainMessage(MSG_DO_SCHEDULE_CALLBACK, action);-->doScheduleCallback-->scheduleFrameLocked
                 msg.arg1 = callbackType;
                 msg.setAsynchronous(true);
                 mHandler.sendMessageAtTime(msg, dueTime);

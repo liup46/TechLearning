@@ -33,8 +33,8 @@ WindowInputEventReceiver{
         //将获取的QueuedInputEvent插入到mPendingInputEventTail的尾部，便于doProcessInputEvents去处理
         enqueueInputEvent(event, this, 0, true){
             -->obtainQueuedInputEvent
-            -->doProcessInputEvents-->deliverInputEvent
-            -->mFirstPostImeInputStage.deliver{ 
+            -->doProcessInputEvents
+            -->deliverInputEvent-->mFirstPostImeInputStage.deliver{ 
                 //责任链
                 EarlyPostImeInputStage-->NativePostImeInputStage-->ViewPostImeInputStage.onProcess(QueuedInputEvent){
                     processPointerEvent-->mView.dispatchPointerEvent(MotionEvent){
