@@ -1,0 +1,135 @@
+//  # XCrash 的监控分析,尤其是anr 监听和native crash, 以及数据的收集
+XCrash.init{
+    if (params.enableJavaCrashHandler) {
+            JavaCrashHandler.getInstance().initialize=>Thread.setDefaultUncaughtExceptionHandler(this)=>uncaughtException(Thread thread, Throwable throwable)
+            =>handleException{
+                //读取堆栈信息写入文件
+                callback.onCrash(logFile)
+            }
+    }
+    //通过FileObserver 监控目录“/data/anr/"下的 CLOSE_WRITE事件, 
+    //1.收到事件后 遍历所有error state的进程,检查当前进程是否在NOT_RESPONDING 2.读trace文件的每一行并检查pid 是否是当前进程.3 是当前进程,写入文件然后callback.onCrash(logFile)
+    //
+    if (params.enableAnrHandler && Build.VERSION.SDK_INT < 21) 
+        AnrHandler.getInstance().initialize
+
+    if (params.enableNativeCrashHandler || (params.enableAnrHandler && Build.VERSION.SDK_INT >= 21)) {
+        r = NativeHandler.getInstance().initialize{
+            System.loadLibrary("xcrash"){
+                JNI_OnLoad(JavaVM *vm)=>xc_common_set_vm(JavaVM *vm, JNIEnv *env, jclass cls = "NativeHandler"){
+                    // 这里保留JavaVM,后续使用
+                    xc_common_vm = vm; 
+                    //创建NativeHandler的全局引用
+                    xc_common_cb_class = (*env)->NewGlobalRef(env, cls);
+                }
+            }
+            nativeInit()==>xc_jni.c.xc_jni_init{
+                // 1. common init 
+                xc_common_init{
+                    /**todo **/
+                }
+                // 2. 监听native crash
+                if(crash_enable){ 
+                    xc_crash_init{
+                        /**todo **/
+                    }
+                }
+                // 3. 监听anr
+                if(trace_enable) 
+                {
+                    //创建事件句柄
+                    xc_trace_notifier = eventfd(0, EFD_CLOEXEC))
+                    xc_trace_init(
+                        xcc_signal_trace_register(xc_trace_handler){
+                            //注册监听SIGQUIT 信号, 收到信号后调用xc_trace_handler 处理函数, 该函数往xc_trace_notifier 句柄写入int 1
+                            sigaction(SIGQUIT, &act, &xcc_signal_trace_oldact)) ==> xc_trace_handler{
+                                data = 1;
+                                write(xc_trace_notifier, &data, sizeof(data)));
+                            }
+                        }
+                        //创建一个线程去执行xc_trace_dumper 函数
+                        pthread_create(&thd, NULL, xc_trace_dumper, NULL)==>xc_trace_dumper{
+                            //通过上文xc_common_vm保存的 JavaVM attach到当前线程, AttachCurrentThread 方法是android ndk 提供的
+                            (*xc_common_vm)->AttachCurrentThread(xc_common_vm, &env, &attach_args)
+                            while(1){
+                                //block here, waiting for sigquit, XCC_UTIL_TEMP_FAILURE_RETRY会不的循环读取xc_trace_notifier eventfd 直到有数据
+                                XCC_UTIL_TEMP_FAILURE_RETRY(read(xc_trace_notifier, &data, sizeof(data)));
+                                //create and open log file
+                                if((fd = xc_common_open_trace_log(pathname, sizeof(pathname), trace_time)) < 0) continue;
+                                //write header info
+                                if(0 != xc_trace_write_header(fd, trace_time)) goto end;
+                                if(0 != xcc_util_write_format(fd, XCC_UTIL_THREAD_SEP"Cmd line: %s\n", xc_common_process_name)) goto end;
+                                if(0 != xcc_util_write_str(fd, "Mode: ART DumpForSigQuit\n")) goto end;
+
+                                //write trace info from ART runtime
+                                //这里很关键, dump 运行时的错误信息
+                                xc_trace_load_symbols(){
+                                    //根据不通的版本, 打开不同的libc++.so, 注意这里不同的版本文件不一样,新版本就可能会有兼容问题呀
+                                    // xc_dl_create 函数: 
+                                    // 1. 遍历/proc/self/maps 的每一行得到 查找libc++.so文件在内存代码段的基址 2.打开libc++.so 文件并mmap到内存,3.然后读Elf格式文件的所有符号表
+                                    if(xc_common_api_level >= 29) libcpp = xc_dl_create(XCC_UTIL_LIBCPP_APEX); //“apex/com.android.runtime/lib/libc++.so”
+                                    if(NULL == libcpp && NULL == (libcpp = xc_dl_create(XCC_UTIL_LIBCPP))) goto end; // "/system/lib/libc++.so"
+                                    //xc_dl_sym函数:  遍历libc++的符号表 找到symbol “ _ZNSt3__14cerrE ” = cerr 的内存指针, 赋值给xc_trace_libcpp_cerr
+                                    if(NULL == (xc_trace_libcpp_cerr = xc_dl_sym(libcpp, XCC_UTIL_LIBCPP_CERR))) goto end;
+                                    
+                                    //打开"/apex/com.android.art/lib/libart.so" 文件,映射到内存,解析出所有符号表
+                                    if(xc_common_api_level >= 30) 
+                                        libart = xc_dl_create(XCC_UTIL_LIBART_APEX_30);  //"/apex/com.android.art/lib/libart.so"
+                                    else if(xc_common_api_level == 29) 
+                                        libart = xc_dl_create(XCC_UTIL_LIBART_APEX_29); //"/apex/com.android.runtime/lib/libart.so"
+                                    if(NULL == libart && NULL == (libart = xc_dl_create(XCC_UTIL_LIBART))) goto end; //"/system/lib/libart.so"
+                                    // 遍历 libart的符号表 找到symbol “ _ZN3art7Runtime9instance_E ” = RUNTIME_INSTANCE 的内存指针            
+                                    if(NULL == (xc_trace_libart_runtime_instance = (void **)xc_dl_sym(libart, XCC_UTIL_LIBART_RUNTIME_INSTANCE))) goto end;
+                                    //找到symbol _ZN3art7Runtime14DumpForSigQuitERNSt3__113basic_ostreamIcNS1_11char_traitsIcEEEE = RUNTIME_DUMP 内存指针
+                                    if(NULL == (xc_trace_libart_runtime_dump = (xcc_util_libart_runtime_dump_t)xc_dl_sym(libart, XCC_UTIL_LIBART_RUNTIME_DUMP))) goto end;
+                                }
+                                //检查上文所有符号地址是否合法, 这个检查是Not reliable
+                                xc_trace_check_address_valid()
+                                //duplicate FD 重定向错误输出到 上文创建到FD
+                                dup2(fd, STDERR_FILENO) 
+                                xc_trace_dump_status = XC_TRACE_DUMP_ON_GOING;
+                                if(sigsetjmp(jmpenv, 1) == 0) 
+                                {
+                                    if(xc_trace_is_lollipop)
+                                        xc_trace_libart_dbg_suspend();
+                                    //这里用xc_trace_libart_runtime_dump的指针在 xc_trace_libart_runtime_instance 上执行dump 内存
+                                    xc_trace_libart_runtime_dump(*xc_trace_libart_runtime_instance, xc_trace_libcpp_cerr);
+                                    if(xc_trace_is_lollipop)
+                                        xc_trace_libart_dbg_resume();
+                                } 
+                                //重置
+                                dup2(xc_common_fd_null, STDERR_FILENO);
+
+                            skip:
+                                if(0 != xcc_util_write_str(fd, "\n"XCC_UTIL_THREAD_END"\n")) goto end;
+                        
+                                //write other info logcat, 执行命令/system/bin/logcat -b %s -d -v threadtime -t 
+                                if(0 != xcc_util_record_logcat(fd, xc_common_process_id, xc_common_api_level, xc_trace_logcat_system_lines, xc_trace_logcat_events_lines, xc_trace_logcat_main_lines)) goto end;
+                                if(xc_trace_dump_fds)
+                                    //读"/proc/%d/fd" 的所有文件 fd
+                                    if(0 != xcc_util_record_fds(fd, xc_common_process_id)) goto end;
+                                if(xc_trace_dump_network_info)
+                                    //读/proc/%d/net/tcp, /proc/%d/net/tcp6", /proc/$pid/net/udp 等文件的信息
+                                    if(0 != xcc_util_record_network_info(fd, xc_common_process_id, xc_common_api_level)) goto end;
+                                //读/proc/$pid/smaps 等信息
+                                if(0 != xcc_meminfo_record(fd, xc_common_process_id)) goto end;
+                            end:
+                                //close log file
+                                xc_common_close_trace_log(fd);
+                                //rethrow SIGQUIT to ART Signal Catcher
+                                if(xc_trace_rethrow && (XC_TRACE_DUMP_ART_CRASH != xc_trace_dump_status)) xc_trace_send_sigquit();
+                                xc_trace_dump_status = XC_TRACE_DUMP_END;
+                        
+                                //JNI callback  执行NativeHandler.traceCallback方法 , callback这里有会获取java 的内存信息
+                                if(NULL == xc_trace_cb_method) continue;
+                                if(NULL == (j_pathname = (*env)->NewStringUTF(env, pathname))) continue;
+                                (*env)->CallStaticVoidMethod(env, xc_common_cb_class, xc_trace_cb_method, j_pathname, NULL);
+                                XC_JNI_IGNORE_PENDING_EXCEPTION();
+                                (*env)->DeleteLocalRef(env, j_pathname);
+                            }
+                            (*xc_common_vm)->DetachCurrentThread(xc_common_vm);
+                        }
+                    }
+                }
+        }
+}
