@@ -44,7 +44,10 @@ XCrash.init{
                         return xcc_signal_crash_register(xc_crash_signal_handler)==>xc_crash_signal_handler{
                             //创建子进程去执行xc_crash_exec_dumper 函数
                             pid_t dumper_pid = xc_crash_fork(xc_crash_exec_dumper)==>xc_crash_exec_dumper{
-                                
+                                //这个函数首先通过 pipe 将一系列的参数，比如进程 pid ，崩溃线程 tid 等，写入到标准的输入当中，其目的是为了子进程从标准的输入当中去读取参数。然后通过 execl() 进入到真正的 dumper 程序
+                                // 通过 execl() 来运行 libxcrash_dumper.so ,而 libxcrash_dumper.so 的入口在 xcd_core.c 中的 main() 。
+                                //main里面的每一个过程就不再进行分析了，这里只说最重要的一点，其最核心的获取线程的 regs、backtrace 等信息是通过 ptrace 技术来获取的。
+                                execl(xc_crash_dumper_pathname, XCC_UTIL_XCRASH_DUMPER_FILENAME, NULL);
                             }
                             ////wait the crash dumper process terminated
                             int wait_r = XCC_UTIL_TEMP_FAILURE_RETRY(waitpid(dumper_pid, &status, __WALL));
