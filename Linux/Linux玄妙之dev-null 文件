@@ -27,3 +27,6 @@ cat $filename >/dev/null
 rm $badname 2>/dev/null
 #### 4.禁止标准输出和标准错误的输出
 cat $filename 2>/dev/null >/dev/null
+#### 5. 丢掉所有输出
+在 linux系统中，有个命令 nohup ，这个命令作用是在系统后台不挂断地运行命令，退出终端不会影响程序的运行。但是在默认情况下（非重定向时），会将日志内容输出到当前目录下一个名叫 nohup.out 的文件里面，那如果我不想要这些日志的内容怎么办，这时候就可以用到 dev/null，命令如下：
+nohup java -jar app.jar > /dev/null 2>&1 &

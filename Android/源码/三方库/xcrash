@@ -1,4 +1,5 @@
-//  # XCrash 的监控分析,尤其是anr 监听和native crash, 以及数据的收集
+//参考链接 https://github.com/caikelun/caikelun.github.io/blob/master/site/blog/2019-06-21-android-app-crash-capture-solution-xcrash.md
+// # XCrash 的监控分析,尤其是anr 监听和native crash, 以及数据的收集
 XCrash.init{
     if (params.enableJavaCrashHandler) {
             JavaCrashHandler.getInstance().initialize=>Thread.setDefaultUncaughtExceptionHandler(this)=>uncaughtException(Thread thread, Throwable throwable)
@@ -24,14 +25,35 @@ XCrash.init{
                 }
             }
             nativeInit()==>xc_jni.c.xc_jni_init{
-                // 1. common init 
+                // 1. common init ,变量赋值
                 xc_common_init{
-                    /**todo **/
                 }
                 // 2. 监听native crash
                 if(crash_enable){ 
                     xc_crash_init{
-                        /**todo **/
+                        xc_crash_init_callback(env){
+                            //eventfd and a new thread for callback
+                            if(0 > (xc_crash_cb_notifier = eventfd(0, EFD_CLOEXEC))) goto err;
+                            //创建一个新的线程执行xc_crash_callback_thread函数,该函数会循环读等待xc_crash_cb_notifier的数据,收到数据后通知到 NativeHandler.traceCallback方法 
+                            if(0 != pthread_create(&xc_crash_cb_thd, NULL, xc_crash_callback_thread, NULL)) goto err;
+                        }
+
+
+                        //注册新号处理函数    {.signum = SIGABRT}, {.signum = SIGBUS},{.signum = SIGFPE},{.signum = SIGILL},{.signum = SIGSEGV},{.signum = SIGTRAP},{.signum = SIGSYS},{.signum = SIGSTKFLT}
+                        //收到信号后执行xc_crash_signal_handler函数
+                        return xcc_signal_crash_register(xc_crash_signal_handler)==>xc_crash_signal_handler{
+                            //创建子进程去执行xc_crash_exec_dumper 函数
+                            pid_t dumper_pid = xc_crash_fork(xc_crash_exec_dumper)==>xc_crash_exec_dumper{
+                                
+                            }
+                            ////wait the crash dumper process terminated
+                            int wait_r = XCC_UTIL_TEMP_FAILURE_RETRY(waitpid(dumper_pid, &status, __WALL));
+                            //JNI callback
+                            xc_crash_callback(){
+                                XCC_UTIL_TEMP_FAILURE_RETRY(write(xc_crash_cb_notifier, &data, sizeof(data)))
+                                pthread_join(xc_crash_cb_thd, NULL);
+                            }
+                        }
                     }
                 }
                 // 3. 监听anr
@@ -133,3 +155,38 @@ XCrash.init{
                 }
         }
 }
+
+## 其他补充资料
+Native 崩溃发生在机器指令运行的层面。比如：APP 中的 so 库、系统的 so 库、JVM 本身等等。Linux kernel 就会向 APP 中对应的线程发送相应的信号（signal），这些信号的默认处理方式是杀死整个进程。用户态进程也可以发送 signal 终止其他进程或自身。
+这些致命的信号分为 2 类，主要有：
+
+* kernel 发出的
+**    SIGFPE: 除数为零。
+**    SIGILL: 无法识别的 CPU 指令。
+**    SIGSYS: 无法识别的系统调用（system call）。
+**    SIGSEGV: 错误的虚拟内存地址访问。
+**    SIGBUS: 错误的物理设备地址访问。
+* 用户态进程发出的
+**    SIGABRT: 调用 abort() / kill() / tkill() / tgkill() 自杀，或被其他进程通过 kill() / tkill() / tgkill() 他杀。
+
+### 信号处理函数
+Naive 崩溃捕获需要注册这些信号的处理函数（signal handler），然后在信号处理函数中收集数据。
+
+因为信号是以“中断”的方式出现的，可能中断任何 CPU 指令序列的执行，所以在信号处理函数中，只能调用“异步信号安全（async-signal-safe）”的函数。例如malloc()、calloc()、free()、snprintf()、gettimeofday() 等等都是不能使用的，C++ STL / boost 也是不能使用的。
+
+所以，在信号处理函数中我们只能不分配堆内存，需要使用堆内存只能在初始化时预分配。如果要使用不在异步信号安全白名单中的 libc / bionic 函数，只能直接调用 system call 或者自己实现。
+
+### 进程崩溃前的极端情况
+当崩溃捕获逻辑开始运行时，会面对很多糟糕的情况，比如：栈溢出、堆内存不可用、虚拟内存地址耗尽、FD 耗尽、Flash 空间耗尽等。有时，这些极端情况的出现，本身就是导致进程崩溃的间接原因。
+
+#### 栈溢出
+我们需要预先用 sigaltstack() 为 signal handler 分配专门的栈内存空间，否则当遇到栈溢出时，signal handler 将无法正常运行。
+
+#### 虚拟内存地址耗尽
+内存泄露很容易导致虚拟内存地址耗尽，特别是在 32 位环境中。这意味着在 signal handler 中也不能使用类似 mmap() 的调用。
+
+####  FD 耗尽
+FD 泄露是常见的导致进程崩溃的间接原因。这意味着在 signal handler 中无法正常的使用依赖于 FD 的操作，比如无法 open() + read() 读取/proc 中的各种信息。为了不干扰 APP 的正常运行，我们仅仅预留了一个 FD，用于在崩溃时可靠的创建出“崩溃信息记录文件”。
+
+####  Flash 空间耗尽
+在 16G / 32G 存储空间的安卓设备中，这种情况经常发生。这意味着 signal handler 无法把崩溃信息记录到本地文件中。我们只能尝试在初始化时预先创建一些“占坑”文件，然后一直循环使用这些“占坑”文件来记录崩溃信息。如果“占坑”文件也创建失败，我们需要把最重要的一些崩溃信息（比如 backtrace）保存在内存中，然后立刻回调和发送这些信息。
